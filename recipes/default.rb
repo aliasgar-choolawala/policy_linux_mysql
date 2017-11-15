@@ -1,4 +1,5 @@
 require 'open3'
+require 'chef/util/file_edit'
 
 services = %w(httpd tomcat7 mysqld)
 packages = ['apache2', 'tomcat-connectors-1.2.42-src', 'tomcat7', 'jdk-8u151-linux-i586', 'make', 'gcc']
@@ -12,16 +13,12 @@ end
 # open port 80 for apache
 stdout, _stderr, _status = Open3.capture3("iptables -A INPUT -p tcp -m state --state NEW -m tcp --dport 80 -j ACCEPT")
 
-env_vars = []
+# retrieving jdk home folder name
 jdk_path, _stderr, _status = Open3.capture3("ls /home/ubuntu | grep jdk")
 
-env_vars.push "export JAVA_HOME=/home/ubuntu/#{jdk_path}"
-env_vars.push "export PATH=$JAVA_HOME/bin:$PATH"
-
-# Append environment variables to .bashrc file
-File.open('/etc/ubuntu/.bashrc', 'a') do |f|
-  f.puts(timeout_arr)
-end
+# append java env variables to .bashrc
+insert_at_end("/etc/ubuntu/.bashrc", "export JAVA_HOME=/home/ubuntu/#{jdk_path}")
+insert_at_end("/etc/ubuntu/.bashrc", "export PATH=$JAVA_HOME/bin:$PATH")
 
 execute 'configure modjk' do
   command './configure --with-apxs=/usr/sbin/apxs'
@@ -98,19 +95,63 @@ workers_config.push "worker.status.type=status"
 
 workers_file << workers_config
 
+# append new configuration to workers.properties
 file "/etc/httpd/conf/workers.properties" do
   content workers_file.join("\n") + "\n"
 end
 
-tomcat1, _stderr, _status = Open3.capture3("ls /home/ubuntu | grep tomcat")
+# create 2 tomcat home dir
+tomcat1, _stderr, _status = Open3.capture3("ls /home/ubuntu | grep tomcat7")
 tomcat2 = "#{tomcat1}_2"
 
 # copying contents of tomcat1 to tomcat2
 stdout, _stderr, _status = Open3.capture3("cp -a /home/ubuntu/#{tomcat1} /home/ubuntu/#{tomcat2}")
 
+# retrieving server.xml path of both instances of tomcatboth tomcat instances
 tomcat1_serverxml_path = Dir.glob("/home/ubuntu/#{tomcat1}/**/config/server.xml")
 tomcat2_serverxml_path = Dir.glob("/home/ubuntu/#{tomcat2}/**/config/server.xml")
 
+# retrieving web.xml path of both instances of tomcat
+tomcat1_webxml_path = Dir.glob("/home/ubuntu/#{tomcat1}/**/server.xml")
+tomcat2_webxml_path = Dir.glob("/home/ubuntu/#{tomcat2}/**/server.xml")
+
+# editing server.xml file for both instances of tomcat
+edit_file(tomcat1_serverxml_path, "protocol=\"AJP/1.3\"", "    <connector port=\"8180\" protocol=\"AJP/1.3\" redirectPort=\"8443\"></connector>")
+edit_file(tomcat2_serverxml_path, "protocol=\"AJP/1.3\"", "    <connector port=\"8181\" protocol=\"AJP/1.3\" redirectPort=\"8443\"></connector>")
+edit_file(tomcat1_serverxml_path, "<engine", "<engine name=\"Catalina\" defaultHost=\"localhost\" jvmRoute=\"tomcat1\"></engine>")
+edit_file(tomcat2_serverxml_path, "<engine", "<engine name=\"Catalina\" defaultHost=\"localhost\" jvmRoute=\"tomcat2\"></engine>")
+edit_file(tomcat1_serverxml_path, "<!-- cluster", "<cluster className=\"org.apache.catalina.ha.tcp.SimpleTcpCluster\"></cluster>")
+edit_file(tomcat2_serverxml_path, "<!-- cluster", "<cluster className=\"org.apache.catalina.ha.tcp.SimpleTcpCluster\"></cluster>")
+
+# addng <distributable> tag for web.xml for both instances of tomcat. This allows sharing of sessions among the Tomcat clustering instances.
+edit_file(tomcat1_webxml_path, "</web>", "<distributable></distributable></web>")
+edit_file(tomcat2_webxml_path, "</web>", "<distributable></distributable></web>")
+
+def edit_file(filename, regex, line)
+  ruby_block "editing #{filename}" do
+    block do
+      chef_file_edit = Chef::Util::FileEdit.new(filename)
+      chef_file_edit.search_file_replace_line(regex, line)
+      chef_file_edit.write_file
+    end
+  end
+end
+
+# adding catalina home env variable for both instances of tomcat
+insert_at_end("/home/ubuntu/#{tomcat1}/bin/catalina.sh", "export CATALINA_HOME=/home/ubuntu/#{tomcat1}")
+insert_at_end("/home/ubuntu/#{tomcat2}/bin/catalina.sh", "export CATALINA_HOME=/home/ubuntu/#{tomcat2}")
+
+def insert_at_end(filename, line)
+  ruby_block "editing #{filename}" do
+    block do
+      chef_file_edit = Chef::Util::FileEdit.new(filename)
+      chef_file_edit.insert_line_if_no_match(line, line)
+      chef_file_edit.write_file
+    end
+  end
+end
+
+# restarting the required services
 services.each do |serv|
   service serv do
     action :restart
